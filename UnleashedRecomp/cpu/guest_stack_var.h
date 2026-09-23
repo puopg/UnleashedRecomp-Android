@@ -17,7 +17,10 @@ private:
     {
         auto ctx = GetPPCContext();
         m_oldStackPtr = ctx->r1.u32;
-        m_ptr = (ctx->r1.u32 - sizeof(T)) & ~(std::max<uint32_t>(alignof(T), 8) - 1);
+        // Keep the guest stack pointer 16-byte aligned, as the Xbox 360 ABI does: guest
+        // code addresses VMX stack slots with lvx/stvx, which ignore the low four bits,
+        // so running it on an 8-aligned stack reads and writes the wrong 16 bytes.
+        m_ptr = (ctx->r1.u32 - sizeof(T)) & ~(std::max<uint32_t>(alignof(T), 16) - 1);
         ctx->r1.u32 = m_ptr;
     }
 
