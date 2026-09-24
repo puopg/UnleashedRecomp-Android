@@ -251,14 +251,14 @@ struct PPCFPSCRRegister
 {
     uint32_t csr;
 
-    static constexpr size_t HostToGuest[] = { PPC_ROUND_NEAREST, PPC_ROUND_DOWN, PPC_ROUND_UP, PPC_ROUND_TOWARD_ZERO };
-
     // simde does not handle denormal flags, so we need to implement per-arch.
 #if defined(__x86_64__) || defined(_M_X64)
     static constexpr size_t RoundShift = 13;
     static constexpr size_t RoundMask = SIMDE_MM_ROUND_MASK;
     static constexpr size_t FlushMask = SIMDE_MM_FLUSH_ZERO_MASK | _MM_DENORMALS_ZERO_MASK;
     static constexpr size_t GuestToHost[] = { SIMDE_MM_ROUND_NEAREST, SIMDE_MM_ROUND_TOWARD_ZERO, SIMDE_MM_ROUND_UP, SIMDE_MM_ROUND_DOWN };
+    // MXCSR.RC: nearest, down (-inf), up (+inf), toward zero.
+    static constexpr size_t HostToGuest[] = { PPC_ROUND_NEAREST, PPC_ROUND_DOWN, PPC_ROUND_UP, PPC_ROUND_TOWARD_ZERO };
 
     inline uint32_t getcsr() noexcept
     {
@@ -275,8 +275,10 @@ struct PPCFPSCRRegister
     static constexpr size_t RoundMask = 3 << RoundShift;
     // FZ and FZ16
     static constexpr size_t FlushMask = (1 << 19) | (1 << 24);
-    // Nearest, Zero, -Infinity, -Infinity
+    // Guest nearest, toward zero, +inf, -inf -> FPCR.RMode RN (0), RZ (3), RP (1), RM (2).
     static constexpr size_t GuestToHost[] = { 0 << RoundShift, 3 << RoundShift, 1 << RoundShift, 2 << RoundShift };
+    // FPCR.RMode: nearest, up (+inf), down (-inf), toward zero.
+    static constexpr size_t HostToGuest[] = { PPC_ROUND_NEAREST, PPC_ROUND_UP, PPC_ROUND_DOWN, PPC_ROUND_TOWARD_ZERO };
 
     inline uint32_t getcsr() noexcept
     {
@@ -287,7 +289,10 @@ struct PPCFPSCRRegister
 
     inline void setcsr(uint32_t csr) noexcept
     {
-        __asm__ __volatile__("msr fpcr, %0" : : "r"(csr));
+        // FPCR is a 64-bit register: pass a 64-bit operand so the upper half is
+        // defined (zero) rather than whatever the register last held.
+        const uint64_t value = csr;
+        __asm__ __volatile__("msr fpcr, %0" : : "r"(value));
     }
 #else
 #   error "Missing implementation for FPSCR."
