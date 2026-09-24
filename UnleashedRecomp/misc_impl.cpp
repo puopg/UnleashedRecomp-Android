@@ -32,13 +32,19 @@ void GlobalMemoryStatusImpl(XLPMEMORYSTATUS lpMemoryStatus)
     lpMemoryStatus->dwAvailVirtual = 0x20000000;
 }
 
-GUEST_FUNCTION_HOOK(sub_831B0ED0, memcpy);
-GUEST_FUNCTION_HOOK(sub_831CCB98, memcpy);
-GUEST_FUNCTION_HOOK(sub_831CEAE0, memcpy);
-GUEST_FUNCTION_HOOK(sub_831CEE04, memcpy);
-GUEST_FUNCTION_HOOK(sub_831CF2D0, memcpy);
-GUEST_FUNCTION_HOOK(sub_831CF660, memcpy);
-GUEST_FUNCTION_HOOK(sub_831B1358, memcpy);
+// The game's copy routines are forward copies, and guest code relies on that when
+// the ranges overlap with dst < src: the game's own memmove (sub_831B5E00) calls its
+// memcpy (sub_831B0ED0) for that case, and Havok's broadphase shifts its endpoint
+// arrays down in place with sub_831B1358. Host memcpy is undefined for overlapping
+// ranges, and some Android libcs do corrupt them, so every copy routine maps to
+// memmove.
+GUEST_FUNCTION_HOOK(sub_831B0ED0, memmove);
+GUEST_FUNCTION_HOOK(sub_831CCB98, memmove);
+GUEST_FUNCTION_HOOK(sub_831CEAE0, memmove);
+GUEST_FUNCTION_HOOK(sub_831CEE04, memmove);
+GUEST_FUNCTION_HOOK(sub_831CF2D0, memmove);
+GUEST_FUNCTION_HOOK(sub_831CF660, memmove);
+GUEST_FUNCTION_HOOK(sub_831B1358, memmove);
 GUEST_FUNCTION_HOOK(sub_831B5E00, memmove);
 GUEST_FUNCTION_HOOK(sub_831B0BA0, memset);
 GUEST_FUNCTION_HOOK(sub_831CCAA0, memset);
