@@ -1,6 +1,12 @@
 # ---- Build output ----
 /out/
 build/
+# Vendored zstd keeps its CMake files under build/cmake, which the rule above
+# would otherwise swallow - without them XenosRecomp cannot configure. Nothing
+# else under zstd's build/ is used.
+!tools/XenosRecomp/thirdparty/zstd/build/
+tools/XenosRecomp/thirdparty/zstd/build/*
+!tools/XenosRecomp/thirdparty/zstd/build/cmake/
 .gradle/
 *.o
 *.obj
