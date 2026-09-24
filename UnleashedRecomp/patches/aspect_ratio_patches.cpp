@@ -993,7 +993,11 @@ static void Draw(PPCContext& ctx, uint8_t* base, PPCFunc* original, uint32_t str
     bool squash = Config::AspectRatio == EAspectRatio::OriginalNarrow && (modifier.flags & TORNADO_DEFENSE) != 0;
 
     uint32_t size = ctx.r5.u32 * stride;
-    ctx.r1.u32 -= size;
+
+    // The copy is `size` bytes, but the stack moves by a multiple of 16 so the guest
+    // code below keeps the 16-byte alignment its VMX stack accesses rely on.
+    const uint32_t stackSize = (size + 15) & ~15u;
+    ctx.r1.u32 -= stackSize;
 
     uint8_t* stack = base + ctx.r1.u32;
     memcpy(stack, base + ctx.r4.u32, size);
@@ -1188,13 +1192,13 @@ static void Draw(PPCContext& ctx, uint8_t* base, PPCFunc* original, uint32_t str
                 *getPosition(i) = *getPosition(i) - width;
         }
 
-        ctx.r1.u32 += size;
+        ctx.r1.u32 += stackSize;
     }
     else
     {
         ctx.r4.u32 = ctx.r1.u32;
         original(ctx, base);
-        ctx.r1.u32 += size;
+        ctx.r1.u32 += stackSize;
     }
 }
 
