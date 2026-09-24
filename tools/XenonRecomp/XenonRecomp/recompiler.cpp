@@ -849,7 +849,7 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_EIEIO:
-        // no op
+        println("\tPPC_EIEIO();");
         break;
 
     case PPC_INST_EXTSB:
@@ -1015,6 +1015,10 @@ bool Recompiler::Recompile(
         println("\t{}.f64 = double(float({}.f64 - {}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]));
         break;
 
+    case PPC_INST_ISYNC:
+        println("\tPPC_ISYNC();");
+        break;
+
     case PPC_INST_LBZ:
         print("\t{}.u64 = PPC_LOAD_U8(", r(insn.operands[0]));
         if (insn.operands[2] != 0)
@@ -1043,7 +1047,9 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_LDARX:
-        print("\t{}.u64 = *(uint64_t*)(base + ", reserved());
+        // volatile: the reservation load must be re-executed on every retry and never
+        // merged with another load (a plain load here is also a C++ data race).
+        print("\t{}.u64 = *(volatile uint64_t*)(base + ", reserved());
         if (insn.operands[1] != 0)
             print("{}.u32 + ", r(insn.operands[1]));
         println("{}.u32);", r(insn.operands[2]));
@@ -1187,7 +1193,8 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_LWARX:
-        print("\t{}.u32 = *(uint32_t*)(base + ", reserved());
+        // volatile: see LDARX.
+        print("\t{}.u32 = *(volatile uint32_t*)(base + ", reserved());
         if (insn.operands[1] != 0)
             print("{}.u32 + ", r(insn.operands[1]));
         println("{}.u32);", r(insn.operands[2]));
@@ -1209,7 +1216,7 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_LWSYNC:
-        // no op
+        println("\tPPC_LWSYNC();");
         break;
 
     case PPC_INST_LWZ:
@@ -1711,7 +1718,7 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_SYNC:
-        // no op
+        println("\tPPC_SYNC();");
         break;
 
     case PPC_INST_TDLGEI:

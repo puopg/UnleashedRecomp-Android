@@ -5,6 +5,7 @@
 #error "ppc_config.h must be included before ppc_context.h"
 #endif
 
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <csetjmp>
@@ -30,6 +31,41 @@
 #define PPC_WEAK_FUNC(x) __attribute__((weak,noinline)) PPC_FUNC(x)
 
 #define PPC_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
+
+// PowerPC memory barriers.
+//
+// These must not be dropped. On a strongly ordered host (x86-64 TSO) they are
+// free - the hardware already guarantees the ordering these instructions ask
+// for, and an acq_rel std::atomic_thread_fence emits no instruction at all. On
+// a weakly ordered host (AArch64) they lower to real `dmb ish` barriers, and
+// without them every lwsync-guarded producer/consumer handoff in the guest -
+// Havok's job dispatch and physics solver among them - runs with no
+// synchronization whatsoever, because guest loads and stores are plain
+// volatile accesses that the CPU is free to reorder.
+//
+//   sync    full barrier                          -> seq_cst
+//   lwsync  LoadLoad + LoadStore + StoreStore     -> acq_rel
+//   isync   acquire barrier after a held branch   -> acquire
+//   eieio   store ordering                        -> release
+//
+// A fence orders the surrounding plain accesses at the hardware level, which is
+// exactly what `dmb ish` does, so the volatile guest accesses above are covered.
+
+#ifndef PPC_SYNC
+#define PPC_SYNC() std::atomic_thread_fence(std::memory_order_seq_cst)
+#endif
+
+#ifndef PPC_LWSYNC
+#define PPC_LWSYNC() std::atomic_thread_fence(std::memory_order_acq_rel)
+#endif
+
+#ifndef PPC_ISYNC
+#define PPC_ISYNC() std::atomic_thread_fence(std::memory_order_acquire)
+#endif
+
+#ifndef PPC_EIEIO
+#define PPC_EIEIO() std::atomic_thread_fence(std::memory_order_release)
+#endif
 
 #ifndef PPC_LOAD_U8
 #define PPC_LOAD_U8(x) *(volatile uint8_t*)(base + (x))
