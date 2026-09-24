@@ -5,12 +5,15 @@
 #include <android/log.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <mutex>
 #include <pthread.h>
@@ -154,6 +157,8 @@ static std::atomic<uint64_t> s_frameCount{ 0 };
 static std::atomic<bool> s_watchdogSuspended{ false };
 static std::once_flag s_watchdogOnce;
 
+static void SampleHungThreads();
+
 static void ReadProcFileTrimmed(const char* path, char* out, size_t outSize)
 {
     out[0] = '\0';
@@ -246,6 +251,7 @@ static void* WatchdogThread(void*)
                     sinceFrame, (unsigned long long)frames, last);
                 WriteLogRecord("[watchdog]", nullptr, line, m > 0 ? size_t(m) : 0);
                 DumpThreads();
+                SampleHungThreads();
                 hung = true;
                 lastDump = now;
             }
@@ -253,6 +259,7 @@ static void* WatchdogThread(void*)
             {
                 WriteLogRecord("[watchdog]", nullptr, "still hung, thread dump follows:", 32);
                 DumpThreads();
+                SampleHungThreads();
                 lastDump = now;
             }
         }
@@ -287,119 +294,336 @@ static void* WatchdogThread(void*)
 // Tombstones land in /data/tombstones, which testers cannot read without root, and
 // half the crash issues arrive with nothing but "it crashed". Catch fatal signals and
 // append the signal, fault address and PC/LR (resolved to module+offset via dladdr)
-// to log.txt with only async-signal-safe raw write()s, then re-raise into the previous
-// handler so the system tombstone/debuggerd flow still runs.
+// to log.txt with only raw write()s, then re-raise into the previous handler so the
+// system tombstone/debuggerd flow still runs.
 
 static struct sigaction s_previousCrashActions[NSIG];
 
-static void CrashWriteRaw(int fd, const char* str)
+// The report is built in a fixed stack buffer (no allocation) and emitted with a
+// single write, which is atomic against other writers on an O_APPEND fd, so a
+// thread logging at the same moment cannot split it.
+struct CrashBuffer
 {
-    size_t len = strlen(str);
-    while (len > 0)
-    {
-        const ssize_t written = write(fd, str, len);
-        if (written <= 0)
-            return;
+    char data[2048];
+    size_t len = 0;
 
-        str += written;
-        len -= size_t(written);
+    void raw(const char* str)
+    {
+        while (*str != '\0' && len < sizeof(data))
+            data[len++] = *str++;
     }
-}
 
-static void CrashWriteHex(int fd, uint64_t value)
-{
-    char buffer[19];
-    char* p = buffer + sizeof(buffer);
-    *--p = '\0';
-    do
+    void hex(uint64_t value)
     {
-        *--p = "0123456789abcdef"[value & 0xF];
-        value >>= 4;
-    } while (value != 0);
-    *--p = 'x';
-    *--p = '0';
-    CrashWriteRaw(fd, p);
-}
-
-static void CrashWriteDec(int fd, uint64_t value)
-{
-    char buffer[21];
-    char* p = buffer + sizeof(buffer);
-    *--p = '\0';
-    do
-    {
-        *--p = char('0' + value % 10);
-        value /= 10;
-    } while (value != 0);
-    CrashWriteRaw(fd, p);
-}
-
-// dladdr is not formally async-signal-safe, but bionic's implementation only walks
-// already-loaded soinfo structures without allocating; debuggerd relies on the same.
-static void CrashWriteAddress(int fd, const char* label, uint64_t address)
-{
-    CrashWriteRaw(fd, label);
-    CrashWriteHex(fd, address);
-
-    Dl_info info{};
-    if (dladdr(reinterpret_cast<void*>(address), &info) != 0 && info.dli_fname != nullptr)
-    {
-        const char* baseName = strrchr(info.dli_fname, '/');
-        CrashWriteRaw(fd, " (");
-        CrashWriteRaw(fd, baseName != nullptr ? baseName + 1 : info.dli_fname);
-        CrashWriteRaw(fd, "+");
-        CrashWriteHex(fd, address - reinterpret_cast<uint64_t>(info.dli_fbase));
-        CrashWriteRaw(fd, ")");
+        char tmp[19];
+        char* p = tmp + sizeof(tmp);
+        *--p = '\0';
+        do
+        {
+            *--p = "0123456789abcdef"[value & 0xF];
+            value >>= 4;
+        } while (value != 0);
+        *--p = 'x';
+        *--p = '0';
+        raw(p);
     }
+
+    void dec(uint64_t value)
+    {
+        char tmp[21];
+        char* p = tmp + sizeof(tmp);
+        *--p = '\0';
+        do
+        {
+            *--p = char('0' + value % 10);
+            value /= 10;
+        } while (value != 0);
+        raw(p);
+    }
+
+    // dladdr is not formally async-signal-safe (bionic takes a recursive loader
+    // lock), but it does not allocate; the report is written in a dying process.
+    void address(const char* label, uint64_t addr)
+    {
+        raw(label);
+        hex(addr);
+
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(addr), &info) != 0 && info.dli_fname != nullptr)
+        {
+            const char* baseName = strrchr(info.dli_fname, '/');
+            raw(" (");
+            raw(baseName != nullptr ? baseName + 1 : info.dli_fname);
+            raw("+");
+            hex(addr - reinterpret_cast<uint64_t>(info.dli_fbase));
+            raw(")");
+        }
+    }
+
+    void flush(int fd)
+    {
+        size_t off = 0;
+        while (off < len)
+        {
+            const ssize_t written = write(fd, data + off, len - off);
+            if (written <= 0)
+                return;
+
+            off += size_t(written);
+        }
+        len = 0;
+    }
+};
+
+// Reading an arbitrary address from a signal handler must not fault: SIGSEGV is
+// blocked while the handler runs, so a second fault kills the process before the
+// report is out. write() from a bad address fails with EFAULT instead of
+// faulting, so pushing the bytes through a pipe we own is a safe probe.
+static int s_crashProbePipe[2] = { -1, -1 };
+
+static bool CrashSafeRead(uint64_t address, void* out, size_t size)
+{
+    if (s_crashProbePipe[1] < 0 || address == 0)
+        return false;
+
+    if (write(s_crashProbePipe[1], reinterpret_cast<const void*>(address), size) != ssize_t(size))
+        return false;
+
+    return read(s_crashProbePipe[0], out, size) == ssize_t(size);
 }
+
+#if defined(__aarch64__)
+// The one-line pc/lr report names the faulting function but not who called it,
+// and testers cannot pull tombstones without root. libmain.so keeps frame
+// pointers, so the frame-record chain from x29 gives the whole call stack -
+// and every recompiled guest function is a host function, so that stack is the
+// guest call chain too. Emitted as a separate write after the main report, so if
+// anything here goes wrong the essential lines are already on disk.
+static void CrashWriteDetails(int fd, const ucontext_t* context)
+{
+    CrashBuffer out;
+
+    // Guest registers live in host registers inside recompiled code, so the raw
+    // x-register values carry guest pointers (as w-register halves).
+    for (int i = 0; i < 31; i++)
+    {
+        if (i % 4 == 0)
+            out.raw(i == 0 ? "[crash] regs" : "\n[crash] regs");
+
+        out.raw(" x");
+        out.dec(uint64_t(i));
+        out.raw("=");
+        out.hex(context->uc_mcontext.regs[i]);
+    }
+    out.raw("\n");
+    out.flush(fd);
+
+    uintptr_t modBase = 0;
+    Dl_info self{};
+    if (dladdr(reinterpret_cast<void*>(&CrashWriteDetails), &self) != 0)
+        modBase = reinterpret_cast<uintptr_t>(self.dli_fbase);
+
+    auto frame = [&](uint64_t addr)
+    {
+        addr &= 0x0000FFFFFFFFFFFFull;
+        Dl_info info{};
+        if (modBase != 0 && dladdr(reinterpret_cast<void*>(addr), &info) != 0 &&
+            reinterpret_cast<uintptr_t>(info.dli_fbase) == modBase)
+        {
+            out.raw(" +");
+            char tmp[17];
+            char* p = tmp + sizeof(tmp);
+            *--p = '\0';
+            uint64_t value = addr - modBase;
+            do
+            {
+                *--p = "0123456789ABCDEF"[value & 0xF];
+                value >>= 4;
+            } while (value != 0);
+            out.raw(p);
+        }
+        else
+        {
+            out.raw(" ");
+            out.hex(addr);
+        }
+    };
+
+    out.raw("[crash] bt:");
+    frame(context->uc_mcontext.pc);
+    frame(context->uc_mcontext.regs[30]);
+
+    uint64_t fp = context->uc_mcontext.regs[29];
+    const uint64_t sp = context->uc_mcontext.sp;
+    for (int depth = 0; depth < 48; depth++)
+    {
+        if (fp < sp || fp - sp > (64ull << 20) || (fp & 15) != 0)
+            break;
+
+        uint64_t record[2];
+        if (!CrashSafeRead(fp, record, sizeof(record)))
+            break;
+
+        if (record[1] == 0)
+            break;
+
+        frame(record[1]);
+
+        if (record[0] <= fp)
+            break;
+
+        fp = record[0];
+        if (depth % 12 == 11)
+        {
+            out.raw("\n[crash] bt:");
+        }
+    }
+
+    out.raw("\n");
+    out.flush(fd);
+}
+#endif
 
 static void CrashSignalHandler(int signal, siginfo_t* info, void* contextPtr)
 {
     const int fd = s_logRawFd.load(std::memory_order_acquire);
     if (fd >= 0)
     {
-        CrashWriteRaw(fd, "[crash] FATAL SIGNAL ");
-        CrashWriteDec(fd, uint64_t(signal));
+        CrashBuffer out;
+
+        out.raw("[crash] FATAL SIGNAL ");
+        out.dec(uint64_t(signal));
         switch (signal)
         {
-            case SIGSEGV: CrashWriteRaw(fd, " (SIGSEGV)"); break;
-            case SIGABRT: CrashWriteRaw(fd, " (SIGABRT)"); break;
-            case SIGBUS:  CrashWriteRaw(fd, " (SIGBUS)"); break;
-            case SIGILL:  CrashWriteRaw(fd, " (SIGILL)"); break;
-            case SIGFPE:  CrashWriteRaw(fd, " (SIGFPE)"); break;
-            case SIGTRAP: CrashWriteRaw(fd, " (SIGTRAP)"); break;
+            case SIGSEGV: out.raw(" (SIGSEGV)"); break;
+            case SIGABRT: out.raw(" (SIGABRT)"); break;
+            case SIGBUS:  out.raw(" (SIGBUS)"); break;
+            case SIGILL:  out.raw(" (SIGILL)"); break;
+            case SIGFPE:  out.raw(" (SIGFPE)"); break;
+            case SIGTRAP: out.raw(" (SIGTRAP)"); break;
         }
 
-        CrashWriteRaw(fd, " code=");
-        CrashWriteDec(fd, uint64_t(info != nullptr ? info->si_code : 0));
-        CrashWriteRaw(fd, " tid=");
-        CrashWriteDec(fd, uint64_t(GetTid()));
+        out.raw(" code=");
+        out.dec(uint64_t(info != nullptr ? info->si_code : 0));
+        out.raw(" tid=");
+        out.dec(uint64_t(GetTid()));
         if (info != nullptr && (signal == SIGSEGV || signal == SIGBUS))
         {
-            CrashWriteRaw(fd, " fault_addr=");
-            CrashWriteHex(fd, reinterpret_cast<uint64_t>(info->si_addr));
+            out.raw(" fault_addr=");
+            out.hex(reinterpret_cast<uint64_t>(info->si_addr));
         }
-        CrashWriteRaw(fd, "\n");
+        out.raw("\n");
 
 #if defined(__aarch64__)
         const ucontext_t* context = static_cast<const ucontext_t*>(contextPtr);
         if (context != nullptr)
         {
-            CrashWriteRaw(fd, "[crash]");
-            CrashWriteAddress(fd, " pc=", context->uc_mcontext.pc);
-            CrashWriteAddress(fd, " lr=", context->uc_mcontext.regs[30]);
-            CrashWriteRaw(fd, " sp=");
-            CrashWriteHex(fd, context->uc_mcontext.sp);
-            CrashWriteRaw(fd, "\n");
+            out.raw("[crash]");
+            out.address(" pc=", context->uc_mcontext.pc);
+            out.address(" lr=", context->uc_mcontext.regs[30]);
+            out.raw(" sp=");
+            out.hex(context->uc_mcontext.sp);
+            out.raw("\n");
         }
 #endif
 
-        CrashWriteRaw(fd, "[crash] end of report; the system tombstone (if any) has the full backtrace.\n");
+        // One write: nothing can interleave into the middle of the report.
+        out.flush(fd);
+
+#if defined(__aarch64__)
+        if (context != nullptr)
+            CrashWriteDetails(fd, context);
+#endif
+
+        out.raw("[crash] end of report\n");
+        out.flush(fd);
     }
 
     // Restore and re-raise so debuggerd still produces the real tombstone.
     sigaction(signal, &s_previousCrashActions[signal], nullptr);
     raise(signal);
+}
+
+// ---------------------------------------------------------------------------
+// Hang sampler
+// ---------------------------------------------------------------------------
+// The thread dump names a spinning thread (state R) but not where it spins. On a
+// hang the watchdog signals every running thread, and each writes its registers
+// and frame-pointer backtrace from inside the handler. Three rounds a little apart
+// show the loop it is stuck in.
+
+static int HangSampleSignal()
+{
+    return SIGRTMIN + 5;
+}
+
+static void HangSampleHandler(int, siginfo_t*, void* contextPtr)
+{
+    // This handler returns into whatever the thread was doing; the probe reads below
+    // can set errno (EFAULT), which must not leak into the interrupted code.
+    const int savedErrno = errno;
+
+    const int fd = s_logRawFd.load(std::memory_order_acquire);
+    if (fd < 0)
+    {
+        errno = savedErrno;
+        return;
+    }
+
+    CrashBuffer out;
+    out.raw("[hang-sample] tid=");
+    out.dec(uint64_t(GetTid()));
+    out.raw(" (register and backtrace lines below are this thread's)\n");
+    out.flush(fd);
+
+#if defined(__aarch64__)
+    if (contextPtr != nullptr)
+        CrashWriteDetails(fd, static_cast<const ucontext_t*>(contextPtr));
+#endif
+
+    errno = savedErrno;
+}
+
+// Only threads that are actually running are signalled: a sleeping thread's stack is
+// already named by its wchan in the thread dump, and interrupting a blocking wait can
+// make it return EINTR into code (driver waits) that does not expect it.
+static void SampleHungThreads()
+{
+    const int self = GetTid();
+    for (int round = 0; round < 3; round++)
+    {
+        DIR* dir = opendir("/proc/self/task");
+        if (dir != nullptr)
+        {
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != nullptr)
+            {
+                if (entry->d_name[0] == '.')
+                    continue;
+
+                const int tid = atoi(entry->d_name);
+                if (tid == self)
+                    continue;
+
+                char path[128];
+                char stat[256];
+                snprintf(path, sizeof(path), "/proc/self/task/%s/stat", entry->d_name);
+                ReadProcFileTrimmed(path, stat, sizeof(stat));
+                char* lastParen = strrchr(stat, ')');
+                const char state = (lastParen != nullptr && lastParen[1] == ' ') ? lastParen[2] : '?';
+
+                if (state == 'R')
+                {
+                    syscall(SYS_tgkill, getpid(), tid, HangSampleSignal());
+                    usleep(20 * 1000); // one thread at a time keeps the output readable
+                }
+            }
+
+            closedir(dir);
+        }
+
+        usleep(150 * 1000);
+    }
 }
 
 static void InstallCrashHandler()
@@ -410,6 +634,12 @@ static void InstallCrashHandler()
     stack.ss_size = sizeof(altStack);
     sigaltstack(&stack, nullptr);
 
+    if (pipe2(s_crashProbePipe, O_CLOEXEC) != 0)
+    {
+        s_crashProbePipe[0] = -1;
+        s_crashProbePipe[1] = -1;
+    }
+
     struct sigaction action{};
     action.sa_sigaction = CrashSignalHandler;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
@@ -417,6 +647,12 @@ static void InstallCrashHandler()
 
     for (const int signal : { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE, SIGTRAP })
         sigaction(signal, &action, &s_previousCrashActions[signal]);
+
+    struct sigaction sample{};
+    sample.sa_sigaction = HangSampleHandler;
+    sample.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+    sigemptyset(&sample.sa_mask);
+    sigaction(HangSampleSignal(), &sample, nullptr);
 }
 
 // ---------------------------------------------------------------------------
